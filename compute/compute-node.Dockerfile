@@ -919,7 +919,32 @@ RUN curl -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux
 
 USER root
 
-    
+#########################################################################################
+#
+# Layer "pg_search-src"
+# Clone ParadeDB open source repository
+#
+#########################################################################################
+FROM build-deps AS pg_search-src
+ARG PARADEDB_TAG=v0.18.11
+
+RUN git clone --recurse-submodules --depth 1 --branch ${PARADEDB_TAG} https://github.com/paradedb/paradedb.git /ext-src/pg_search-src
+
+#########################################################################################
+#
+# Layer "pg_search-build"
+# Build pg_search extension from ParadeDB OSS
+#
+#########################################################################################
+FROM rust-extensions-build-pgrx12_7 AS pg_search-build
+ARG PG_VERSION
+COPY --from=pg_search-src /ext-src/ /ext-src/
+WORKDIR /ext-src/pg_search-src/pg_search
+RUN cargo pgrx install --release && \
+    sed -i 's/superuser = false/superuser = true/g' /usr/local/pgsql/share/extension/pg_search.control && \
+    echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_search.control
+
+
 
 #########################################################################################
 #
@@ -1718,6 +1743,7 @@ COPY --from=pgjwt-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_jsonschema-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_graphql-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg_search-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_tiktoken-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=hypopg-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=online_advisor-build /usr/local/pgsql/ /usr/local/pgsql/
