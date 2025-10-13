@@ -76,7 +76,7 @@
 # That step is done by the 'vm-builder' tool. See the vm-compute-node-image job in the
 # build_and_test.yml github workflow for how that's done.
 
-ARG PG_VERSION
+ARG PG_VERSION=v16
 ARG BUILD_TAG
 ARG DEBIAN_VERSION=bookworm
 ARG DEBIAN_FLAVOR=${DEBIAN_VERSION}-slim
@@ -885,6 +885,41 @@ WORKDIR /ext-src/pg_cron-src
 RUN make -j $(getconf _NPROCESSORS_ONLN) && \
     make -j $(getconf _NPROCESSORS_ONLN) install && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_cron.control
+
+#########################################################################################
+#
+# Layer "rust extensions pgrx12.7"
+#
+# Essentially, this layer is the same as above, but instead of pgrx 0.12.6, it
+# uses 0.12.7. 0.12.7, specifically, is necessary for building pg_search from
+# ParadeDB, according to the ParadeDB team. Eventually, we can remove this layer
+# when ParadeDB gets various pgrx changes upstreamed.
+#
+#########################################################################################
+FROM build-deps AS rust-extensions-build-pgrx12_7
+ARG PG_VERSION
+COPY --from=pg-build /usr/local/pgsql/ /usr/local/pgsql/
+
+RUN apt update && \
+    apt install --no-install-recommends --no-install-suggests -y curl libclang-dev && \
+    apt clean && rm -rf /var/lib/apt/lists/* && \
+    useradd -ms /bin/bash nonroot -b /home
+
+ENV HOME=/home/nonroot
+ENV PATH="/home/nonroot/.cargo/bin:/usr/local/pgsql/bin/:$PATH"
+USER nonroot
+WORKDIR /home/nonroot
+
+RUN curl -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable && \
+    rm rustup-init && \
+    cargo install --locked --version 0.12.7 cargo-pgrx && \
+    /bin/bash -c 'cargo pgrx init --pg${PG_VERSION:1}=/usr/local/pgsql/bin/pg_config'
+
+USER root
+
+    
 
 #########################################################################################
 #
