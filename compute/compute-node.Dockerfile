@@ -263,8 +263,8 @@ RUN case "${PG_VERSION:?}" in \
         export POSTGIS_CHECKSUM=ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510 \
     ;; \
     "v14" | "v15" | "v16") \
-        export POSTGIS_VERSION=3.3.3 \
-        export POSTGIS_CHECKSUM=74eb356e3f85f14233791013360881b6748f78081cc688ff9d6f0f673a762d13 \
+        export POSTGIS_VERSION=3.4.2 \
+        export POSTGIS_CHECKSUM=c8c874c00ba4a984a87030af6bf9544821502060ad473d5c96f1d4d0835c5892 \
     ;; \
     *) \
         echo "unexpected PostgreSQL version" && exit 1 \
@@ -522,9 +522,9 @@ COPY compute/patches/pgvector.patch .
 # Pass OPTFLAGS="" to remove it.
 #
 # vector >0.7.4 supports v17
-# last release v0.8.0 - Oct 30, 2024
-RUN wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz -O pgvector.tar.gz && \
-    echo "867a2c328d4928a5a9d6f052cd3bc78c7d60228a9b914ad32aa3db88e9de27b0 pgvector.tar.gz" | sha256sum --check && \
+# last release v0.8.3 - May 2025
+RUN wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.3.tar.gz -O pgvector.tar.gz && \
+    echo "dc080c511a6354a1628eb19f9bc8e77ce880dde16c889744a6814c8c0006e36c pgvector.tar.gz" | sha256sum --check && \
     mkdir pgvector-src && cd pgvector-src && tar xzf ../pgvector.tar.gz --strip-components=1 -C . && \
     wget https://github.com/pgvector/pgvector/raw/refs/tags/v0.7.4/sql/vector.sql -O ./sql/vector--0.7.4.sql && \
     echo "10218d05dc02299562252a9484775178b14a1d8edb92a2d1672ef488530f7778 ./sql/vector--0.7.4.sql" | sha256sum --check && \
