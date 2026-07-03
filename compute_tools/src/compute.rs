@@ -128,6 +128,10 @@ pub struct ComputeNodeParams {
     pub pg_isready_bin: String,
     pub lakebase_mode: bool,
 
+    /// Set neon.file_cache_resume=on so Postgres resumes the LFC left by the
+    /// previous instance instead of truncating it on startup.
+    pub preserve_lfc: bool,
+
     pub build_tag: String,
     pub control_plane_uri: Option<String>,
     pub config_path_test_only: Option<OsString>,

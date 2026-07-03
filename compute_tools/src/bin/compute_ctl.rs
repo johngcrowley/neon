@@ -154,6 +154,13 @@ struct Cli {
 
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub lakebase_mode: bool,
+
+    /// Preserve the LFC across compute restarts: sets neon.file_cache_resume=on
+    /// so Postgres resumes the file cache left by the previous instance instead
+    /// of truncating it. Requires neon.file_cache_path on storage that survives
+    /// pod restarts (i.e. outside pgdata).
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub preserve_lfc: bool,
 }
 
 impl Cli {
@@ -272,6 +279,7 @@ fn main() -> Result<()> {
             pg_isready_bin: get_pg_isready_bin(&cli.pgbin),
             instance_id: std::env::var("INSTANCE_ID").ok(),
             lakebase_mode: cli.lakebase_mode,
+            preserve_lfc: cli.preserve_lfc,
             build_tag: BUILD_TAG.to_string(),
             control_plane_uri: cli.control_plane_uri,
             config_path_test_only: cli.config,

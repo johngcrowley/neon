@@ -249,6 +249,24 @@ pub fn write_postgres_conf(
         writeln!(file, "# Managed by compute_ctl: end")?;
     }
 
+    // Resume the local file cache left behind by the previous instance instead
+    // of truncating it on startup. Written after the spec settings so the flag
+    // always wins. Only useful when neon.file_cache_path points at storage that
+    // survives restarts: with the path inside pgdata (which compute_ctl wipes)
+    // the extension simply finds no cache to resume and starts cold.
+    if params.preserve_lfc {
+        if let Some(lfc_path) = spec.cluster.settings.find("neon.file_cache_path") {
+            if Path::new(&lfc_path).starts_with(pgdata_path) {
+                tracing::warn!(
+                    "--preserve-lfc has no effect: neon.file_cache_path ({lfc_path}) is inside \
+                     pgdata, which is wiped on every start"
+                );
+            }
+        }
+        writeln!(file, "# from compute_ctl --preserve-lfc")?;
+        writeln!(file, "neon.file_cache_resume=on")?;
+    }
+
     // If base audit logging is enabled, configure it.
     // In this setup, the audit log will be written to the standard postgresql log.
     //

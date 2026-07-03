@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -19,9 +20,13 @@
 
 #include "access/parallel.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "common/controldata_utils.h"
 #include "common/hashfn.h"
+#include "port/pg_crc32c.h"
 #include "pgstat.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
@@ -219,6 +224,7 @@ static int	lfc_prewarm_batch;
 static int	lfc_chunk_size_log = MAX_BLOCKS_PER_CHUNK_LOG;
 static int	lfc_blocks_per_chunk = MAX_BLOCKS_PER_CHUNK;
 static char *lfc_path;
+static bool	lfc_resume;
 static uint64 lfc_generation;
 static FileCacheControl *lfc_ctl;
 static bool lfc_do_prewarm;
@@ -341,6 +347,530 @@ lfc_ensure_opened(void)
 	return true;
 }
 
+/*
+ * Resuming LFC contents across restarts
+ * -------------------------------------
+ *
+ * Normally the cache is reconstructed from scratch at node startup, because
+ * the mapping from chunk file offsets to buffer tags lives only in shared
+ * memory. When neon.file_cache_resume is enabled, the postmaster dumps that
+ * mapping to '<neon.file_cache_path>.resume' when it exits after a clean
+ * shutdown, and the next incarnation restores it instead of truncating the
+ * cache file, so the cache starts warm with no pageserver traffic.
+ *
+ * This is only correct if the cache contents exactly match the state of the
+ * timeline the new incarnation starts at. Three properties guarantee that:
+ *
+ * 1. The state is dumped only after a clean shutdown (pg_control says
+ *    DB_SHUTDOWNED). The shutdown checkpoint has flushed every dirty buffer
+ *    through the SMGR into the LFC, so the cache holds the latest version of
+ *    every page it contains. The dump happens at postmaster exit, after all
+ *    children are gone, so the mapping can no longer change under us.
+ *
+ * 2. The dump records the WAL insert position at shutdown. On startup we
+ *    compare it against checkPointCopy.redo in the new pg_control: the
+ *    pageserver sets that field to normalize_lsn(basebackup LSN)
+ *    (see generate_pg_control() in libs/postgres_ffi). They match only if
+ *    no WAL whatsoever was written between our shutdown and the basebackup,
+ *    i.e. nobody else modified the timeline in between. System identifier,
+ *    tenant and timeline ids are also checked, which covers reassignment of
+ *    the compute (and its persistent cache volume) to a different branch.
+ *
+ * 3. The state file is single use: it is unlinked (durably) before the
+ *    restored cache is used, so a crash can never resurrect an older map
+ *    for a newer cache file.
+ *
+ * If any validation fails we fall back to the normal cold start, truncating
+ * the cache file as before. Losing the state file is never a correctness
+ * problem, only a warmth problem.
+ *
+ * Note that unlogged and temporary relations never enter the LFC (the neon
+ * SMGR routes them to the md layer), so resuming cannot resurrect pages of
+ * relations that PostgreSQL resets on restart.
+ */
+
+#define LFC_RESUME_MAGIC	0x4C464352	/* "LFCR" */
+#define LFC_RESUME_VERSION	1
+
+typedef struct LfcResumeHeader
+{
+	uint32		magic;
+	uint32		version;
+	uint32		pg_version;		/* PG_VERSION_NUM / 10000 */
+	uint32		blcksz;			/* BLCKSZ */
+	uint32		chunk_size_log;
+	uint32		n_entries;		/* number of LfcResumeEntry records */
+	uint32		size_chunks;	/* nominal size of cache file, in chunks */
+	uint32		reserved;
+	uint64		system_identifier;
+	XLogRecPtr	end_of_wal;		/* normalized WAL insert position at shutdown */
+	char		tenant_id[40];
+	char		timeline_id[40];
+	pg_crc32c	crc;			/* CRC of the entry array */
+} LfcResumeHeader;
+
+typedef struct LfcResumeEntry
+{
+	BufferTag	key;
+	uint32		offset;			/* chunk offset in cache file */
+	uint8		bitmap[MAX_BLOCKS_PER_CHUNK / 8];	/* AVAILABLE blocks */
+} LfcResumeEntry;
+
+static bool lfc_resume_hook_registered;
+
+static char *
+lfc_resume_state_path(void)
+{
+	return psprintf("%s.resume", lfc_path);
+}
+
+/*
+ * Same normalization as normalize_lsn() in libs/postgres_ffi/src/xlog_utils.rs,
+ * which the pageserver applies to the basebackup LSN before storing it in the
+ * checkPointCopy.redo field of the generated pg_control file.
+ */
+static XLogRecPtr
+lfc_normalize_lsn(XLogRecPtr lsn)
+{
+	if (lsn % XLOG_BLCKSZ == 0)
+		lsn += (lsn % wal_segment_size == 0) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
+	else
+		lsn = MAXALIGN64(lsn);
+	return lsn;
+}
+
+static void
+lfc_fsync_parent_dir(const char *path)
+{
+	char	   *dir = pstrdup(path);
+	char	   *sep = strrchr(dir, '/');
+	int			fd;
+
+	if (sep != NULL && sep != dir)
+		*sep = '\0';
+	else
+	{
+		pfree(dir);
+		dir = pstrdup(".");
+	}
+	fd = BasicOpenFile(dir, O_RDONLY | PG_BINARY);
+	if (fd >= 0)
+	{
+		(void) pg_fsync(fd);
+		close(fd);
+	}
+	pfree(dir);
+}
+
+static bool
+lfc_write_all(int fd, const void *buf, size_t len)
+{
+	const char *p = (const char *) buf;
+
+	while (len > 0)
+	{
+		ssize_t		rc = write(fd, p, len);
+
+		if (rc <= 0)
+		{
+			if (rc < 0 && errno == EINTR)
+				continue;
+			return false;
+		}
+		p += rc;
+		len -= (size_t) rc;
+	}
+	return true;
+}
+
+static bool
+lfc_read_all(int fd, void *buf, size_t len)
+{
+	char	   *p = (char *) buf;
+
+	while (len > 0)
+	{
+		ssize_t		rc = read(fd, p, len);
+
+		if (rc <= 0)
+		{
+			if (rc < 0 && errno == EINTR)
+				continue;
+			return false;
+		}
+		p += rc;
+		len -= (size_t) rc;
+	}
+	return true;
+}
+
+/*
+ * on_shmem_exit callback: persist the LFC mapping so that the next
+ * incarnation can resume the cache. Runs in the postmaster only, at exit,
+ * after all child processes are gone.
+ */
+static void
+lfc_dump_resume_state(int code, Datum arg)
+{
+	ControlFileData *controlfile;
+	bool		crc_ok;
+	LfcResumeHeader hdr = {0};
+	LfcResumeEntry *entries;
+	dlist_iter	iter;
+	uint32		n_entries = 0;
+	uint32		max_entries;
+	char	   *path;
+	char	   *tmp_path;
+	int			fd;
+	bool		write_ok;
+
+	(void) arg;
+
+	if (IsUnderPostmaster)		/* forked children inherit this callback */
+		return;
+	if (code != 0 || !lfc_resume || lfc_ctl == NULL || lfc_max_size <= 0)
+		return;
+	if (!LFC_ENABLED())
+		return;
+
+	/*
+	 * Only a clean shutdown leaves the LFC in sync with the WAL: the
+	 * shutdown checkpoint has written out every dirty buffer. After a crash
+	 * the cache may lack pages whose WAL already reached the safekeepers,
+	 * and resuming it would serve stale versions.
+	 */
+	controlfile = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok || controlfile->state != DB_SHUTDOWNED)
+		return;
+
+	/*
+	 * Make the cache contents durable before persisting a map that promises
+	 * they exist. LFC writes are never fsynced during normal operation.
+	 */
+	fd = BasicOpenFile(lfc_path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+	{
+		elog(LOG, "LFC: cannot open %s to sync it, not saving resume state: %m", lfc_path);
+		return;
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		elog(LOG, "LFC: failed to sync %s, not saving resume state: %m", lfc_path);
+		close(fd);
+		return;
+	}
+	close(fd);
+
+	max_entries = lfc_ctl->used;
+	entries = palloc0((size_t) Max(max_entries, 1) * sizeof(LfcResumeEntry));
+
+	/* No other processes are alive, but keep the locking discipline */
+	LWLockAcquire(lfc_lock, LW_SHARED);
+	dlist_foreach(iter, &lfc_ctl->lru)	/* oldest to newest */
+	{
+		FileCacheEntry *entry = dlist_container(FileCacheEntry, list_node, iter.cur);
+		LfcResumeEntry *re;
+
+		if (n_entries >= max_entries)
+			break;
+		re = &entries[n_entries];
+		re->key = entry->key;
+		re->offset = entry->offset;
+		for (int j = 0; j < lfc_blocks_per_chunk; j++)
+		{
+			if (GET_STATE(entry, j) == AVAILABLE)
+				BITMAP_SET(re->bitmap, j);
+		}
+		n_entries += 1;
+	}
+	hdr.size_chunks = lfc_ctl->size;
+	LWLockRelease(lfc_lock);
+
+	if (n_entries == 0)			/* nothing worth resuming */
+	{
+		pfree(entries);
+		return;
+	}
+
+	hdr.magic = LFC_RESUME_MAGIC;
+	hdr.version = LFC_RESUME_VERSION;
+	hdr.pg_version = PG_VERSION_NUM / 10000;
+	hdr.blcksz = BLCKSZ;
+	hdr.chunk_size_log = lfc_chunk_size_log;
+	hdr.n_entries = n_entries;
+	hdr.system_identifier = controlfile->system_identifier;
+	hdr.end_of_wal = lfc_normalize_lsn(GetXLogInsertRecPtr());
+	strlcpy(hdr.tenant_id, neon_tenant ? neon_tenant : "", sizeof(hdr.tenant_id));
+	strlcpy(hdr.timeline_id, neon_timeline ? neon_timeline : "", sizeof(hdr.timeline_id));
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, entries, (size_t) n_entries * sizeof(LfcResumeEntry));
+	FIN_CRC32C(hdr.crc);
+
+	path = lfc_resume_state_path();
+	tmp_path = psprintf("%s.tmp", path);
+
+	fd = BasicOpenFile(tmp_path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+	{
+		elog(LOG, "LFC: failed to create resume state file %s: %m", tmp_path);
+		pfree(entries);
+		return;
+	}
+	write_ok = lfc_write_all(fd, &hdr, sizeof(hdr))
+		&& lfc_write_all(fd, entries, (size_t) n_entries * sizeof(LfcResumeEntry))
+		&& pg_fsync(fd) == 0;
+	close(fd);
+	pfree(entries);
+
+	if (!write_ok || rename(tmp_path, path) != 0)
+	{
+		elog(LOG, "LFC: failed to write resume state file %s: %m", tmp_path);
+		unlink(tmp_path);
+		return;
+	}
+	lfc_fsync_parent_dir(path);
+
+	elog(LOG, "LFC: saved resume state to %s: %u chunks, end of WAL %X/%X",
+		 path, n_entries, LSN_FORMAT_ARGS(hdr.end_of_wal));
+}
+
+/*
+ * Try to restore the LFC mapping saved by the previous incarnation.
+ *
+ * Called from LfcShmemInit() with freshly initialized (empty) control
+ * structures. Returns true if the mapping was restored, in which case the
+ * cache file is used as is. Returns false if there is no state file or any
+ * validation failed; the caller then truncates the cache file as usual.
+ *
+ * The state file is consumed (durably unlinked) no matter what.
+ */
+static bool
+lfc_try_resume_state(void)
+{
+	char	   *path = lfc_resume_state_path();
+	int			fd;
+	struct stat cache_st;
+	LfcResumeHeader hdr;
+	LfcResumeEntry *entries = NULL;
+	ControlFileData *controlfile;
+	bool		crc_ok;
+	pg_crc32c	crc;
+	bool	   *used_offsets = NULL;
+	uint32		limit_chunks = SIZE_MB_TO_CHUNKS(lfc_size_limit);
+	uint32		max_chunks = SIZE_MB_TO_CHUNKS(lfc_max_size);
+	uint64		chunk_bytes = (uint64) lfc_blocks_per_chunk * BLCKSZ;
+	uint32		n_pages = 0;
+	bool		header_ok;
+
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+			elog(LOG, "LFC: cannot open resume state file %s: %m", path);
+		return false;
+	}
+
+	header_ok = lfc_read_all(fd, &hdr, sizeof(hdr))
+		&& hdr.magic == LFC_RESUME_MAGIC
+		&& hdr.version == LFC_RESUME_VERSION
+		&& hdr.pg_version == PG_VERSION_NUM / 10000
+		&& hdr.blcksz == BLCKSZ
+		&& hdr.chunk_size_log == lfc_chunk_size_log
+		&& hdr.n_entries > 0
+		&& hdr.n_entries <= hdr.size_chunks
+		&& hdr.size_chunks <= max_chunks;
+
+	if (header_ok)
+	{
+		entries = palloc((size_t) hdr.n_entries * sizeof(LfcResumeEntry));
+		if (!lfc_read_all(fd, entries, (size_t) hdr.n_entries * sizeof(LfcResumeEntry)))
+		{
+			pfree(entries);
+			entries = NULL;
+		}
+	}
+	close(fd);
+
+	/*
+	 * Single use: whatever happens next, this state must never be applied to
+	 * a cache file it doesn't describe. Unlink durably before the cache can
+	 * be modified.
+	 */
+	unlink(path);
+	lfc_fsync_parent_dir(path);
+
+	if (entries == NULL)
+	{
+		elog(LOG, "LFC: resume state file %s is malformed or from an incompatible configuration, starting with cold cache", path);
+		return false;
+	}
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, entries, (size_t) hdr.n_entries * sizeof(LfcResumeEntry));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, hdr.crc))
+	{
+		elog(LOG, "LFC: resume state file %s has wrong checksum, starting with cold cache", path);
+		goto discard;
+	}
+
+	if (hdr.n_entries > limit_chunks)
+	{
+		elog(LOG, "LFC: resume state (%u chunks) does not fit in neon.file_cache_size_limit (%u chunks), starting with cold cache",
+			 hdr.n_entries, limit_chunks);
+		goto discard;
+	}
+
+	controlfile = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		goto discard;
+	if (controlfile->system_identifier != hdr.system_identifier
+		|| strncmp(hdr.tenant_id, neon_tenant ? neon_tenant : "", sizeof(hdr.tenant_id)) != 0
+		|| strncmp(hdr.timeline_id, neon_timeline ? neon_timeline : "", sizeof(hdr.timeline_id)) != 0)
+	{
+		elog(LOG, "LFC: resume state belongs to a different tenant/timeline, starting with cold cache");
+		goto discard;
+	}
+
+	/*
+	 * The crucial check: resume only if the basebackup we start from sits at
+	 * exactly the WAL position the previous incarnation shut down at. If any
+	 * WAL was written in between, pages in the cache may be stale.
+	 */
+	if (controlfile->checkPointCopy.redo != hdr.end_of_wal)
+	{
+		elog(LOG, "LFC: WAL advanced since resume state was saved (%X/%X vs %X/%X), starting with cold cache",
+			 LSN_FORMAT_ARGS(controlfile->checkPointCopy.redo),
+			 LSN_FORMAT_ARGS(hdr.end_of_wal));
+		goto discard;
+	}
+
+	if (stat(lfc_path, &cache_st) != 0
+		|| (uint64) cache_st.st_size > (uint64) hdr.size_chunks * chunk_bytes)
+	{
+		elog(LOG, "LFC: cache file %s does not match resume state, starting with cold cache", lfc_path);
+		goto discard;
+	}
+
+	/* Validate every entry before touching the hash */
+	used_offsets = palloc0((size_t) hdr.size_chunks * sizeof(bool));
+	for (uint32 i = 0; i < hdr.n_entries; i++)
+	{
+		LfcResumeEntry *re = &entries[i];
+
+		if (re->offset >= hdr.size_chunks
+			|| used_offsets[re->offset]
+			|| (re->key.blockNum & (lfc_blocks_per_chunk - 1)) != 0)
+			goto corrupt;
+		used_offsets[re->offset] = true;
+
+		for (int j = 0; j < MAX_BLOCKS_PER_CHUNK; j++)
+		{
+			BufferTag	test_tag;
+
+			if (!BITMAP_ISSET(re->bitmap, j))
+				continue;
+			if (j >= lfc_blocks_per_chunk)
+				goto corrupt;
+			/* the promised block must actually exist in the cache file */
+			if ((uint64) re->offset * chunk_bytes + ((uint64) j + 1) * BLCKSZ > (uint64) cache_st.st_size)
+				goto corrupt;
+			test_tag = re->key;
+			test_tag.blockNum += j;
+			if (!BufferTagIsValid(&test_tag))
+				goto corrupt;
+		}
+	}
+
+	/* All good: rebuild the hash table and LRU in dump (oldest first) order */
+	for (uint32 i = 0; i < hdr.n_entries; i++)
+	{
+		LfcResumeEntry *re = &entries[i];
+		uint32		hash = get_hash_value(lfc_hash, &re->key);
+		FileCacheEntry *entry;
+		bool		found;
+
+		entry = hash_search_with_hash_value(lfc_hash, &re->key, hash, HASH_ENTER, &found);
+		if (found)				/* duplicate key: cannot happen in a valid dump */
+			goto reset;
+		entry->hash = hash;
+		entry->offset = re->offset;
+		entry->access_count = 0;
+		for (int j = 0; j < lfc_blocks_per_chunk; j++)
+		{
+			if (BITMAP_ISSET(re->bitmap, j))
+			{
+				SET_STATE(entry, j, AVAILABLE);
+				n_pages += 1;
+			}
+			else
+				SET_STATE(entry, j, UNAVAILABLE);
+		}
+		dlist_push_tail(&lfc_ctl->lru, &entry->list_node);
+	}
+
+	/* Offsets the map doesn't cover keep their space as reusable holes */
+	for (uint32 off = 0; off < hdr.size_chunks; off++)
+	{
+		BufferTag	holetag;
+		uint32		hash;
+		FileCacheEntry *hole;
+		bool		found;
+
+		if (used_offsets[off])
+			continue;
+		memset(&holetag, 0, sizeof(holetag));
+		holetag.blockNum = off;
+		hash = get_hash_value(lfc_hash, &holetag);
+		hole = hash_search_with_hash_value(lfc_hash, &holetag, hash, HASH_ENTER, &found);
+		if (found)
+			goto reset;
+		hole->hash = hash;
+		hole->offset = off;
+		hole->access_count = 0;
+		dlist_push_tail(&lfc_ctl->holes, &hole->list_node);
+	}
+
+	lfc_ctl->size = hdr.size_chunks;
+	lfc_ctl->used = hdr.n_entries;
+	lfc_ctl->used_pages = n_pages;
+	lfc_ctl->limit = limit_chunks;
+
+	elog(LOG, "LFC: resumed %u chunks (%u pages) from previous instance at %X/%X",
+		 hdr.n_entries, n_pages, LSN_FORMAT_ARGS(hdr.end_of_wal));
+
+	pfree(used_offsets);
+	pfree(entries);
+	return true;
+
+corrupt:
+	elog(LOG, "LFC: resume state file %s contains invalid entries, starting with cold cache", path);
+	goto discard;
+
+reset:
+	/* Undo a partial restore: clear everything we may have entered */
+	{
+		HASH_SEQ_STATUS status;
+		FileCacheEntry *entry;
+
+		hash_seq_init(&status, lfc_hash);
+		while ((entry = hash_seq_search(&status)) != NULL)
+			hash_search_with_hash_value(lfc_hash, &entry->key, entry->hash, HASH_REMOVE, NULL);
+		dlist_init(&lfc_ctl->lru);
+		dlist_init(&lfc_ctl->holes);
+		lfc_ctl->size = 0;
+		lfc_ctl->used = 0;
+		lfc_ctl->used_pages = 0;
+		elog(LOG, "LFC: resume state file %s is inconsistent, starting with cold cache", path);
+	}
+
+discard:
+	if (used_offsets)
+		pfree(used_offsets);
+	pfree(entries);
+	return false;
+}
+
 void
 LfcShmemInit(void)
 {
@@ -375,23 +905,47 @@ LfcShmemInit(void)
 		/* Initialize hyper-log-log structure for estimating working set size */
 		initSHLL(&lfc_ctl->wss_estimation);
 
-		/* Recreate file cache on restart */
-		fd = BasicOpenFile(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
-		if (fd < 0)
+		/*
+		 * Resume cache contents from the previous instance if configured and
+		 * provably safe; otherwise recreate the file cache on restart.
+		 */
+		if (lfc_resume && lfc_try_resume_state())
 		{
-			elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_path);
-			lfc_ctl->limit = 0;
+			/* mapping restored, cache file left intact */
 		}
 		else
 		{
-			close(fd);
-			lfc_ctl->limit = SIZE_MB_TO_CHUNKS(lfc_size_limit);
+			/* stale resume state, if any, no longer describes this file */
+			unlink(lfc_resume_state_path());
+
+			fd = BasicOpenFile(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
+			if (fd < 0)
+			{
+				elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_path);
+				lfc_ctl->limit = 0;
+			}
+			else
+			{
+				close(fd);
+				lfc_ctl->limit = SIZE_MB_TO_CHUNKS(lfc_size_limit);
+			}
 		}
 
 		/* Initialize turnstile of condition variables */
 		for (int i = 0; i < N_COND_VARS; i++)
 			ConditionVariableInit(&lfc_ctl->cv[i]);
 
+	}
+
+	/*
+	 * Arrange for the mapping to be dumped at postmaster exit. Register only
+	 * once: shared memory may be recreated after a backend crash, but exit
+	 * callbacks survive that.
+	 */
+	if (lfc_resume && !IsUnderPostmaster && !lfc_resume_hook_registered)
+	{
+		on_shmem_exit(lfc_dump_resume_state, (Datum) 0);
+		lfc_resume_hook_registered = true;
 	}
 }
 
@@ -595,6 +1149,18 @@ lfc_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+
+	DefineCustomBoolVariable("neon.file_cache_resume",
+							 "Resume LFC contents from the previous instance on startup",
+							 "Requires neon.file_cache_path on storage that survives restarts. "
+							 "The cache is resumed only after a clean shutdown at an unchanged WAL position.",
+							 &lfc_resume,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomIntVariable("neon.file_cache_chunk_size",
 							"LFC chunk size in blocks (should be power of two)",
