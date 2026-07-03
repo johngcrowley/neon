@@ -52,7 +52,7 @@ LfcResumeHeader                 136 bytes
   system_identifier               from pg_control
   end_of_wal                      normalized WAL insert position
   tenant_id, timeline_id          from the neon.* GUCs
-  crc                             CRC-32C of the entry array
+  crc                             CRC-32C of header (crc zeroed) + entries
 LfcResumeEntry × n_entries      40 bytes each
   key                             BufferTag of the chunk's first block
   offset                          chunk index in the cache file
@@ -85,7 +85,9 @@ Then the gauntlet, any failure of which means a cold start and a one-line LOG
 explaining why:
 
 - magic, version, Postgres major, `BLCKSZ`, and chunk size must match the
-  running binary's configuration, and the CRC must verify;
+  running binary's configuration, and the CRC must verify — the CRC covers
+  the header as well as the entries, since the header carries the LSN and
+  identity fields that gate the resume;
 - `system_identifier`, `neon.tenant_id`, and `neon.timeline_id` must match
   the fresh basebackup's — a compute (or its cache volume) reattached to a
   different branch, or a PITR onto a new timeline, is refused here;
@@ -181,7 +183,13 @@ Smoke-tested end to end on an isolated `neon_local` instance (PG 16):
   200,000 rows of deterministic data (`pad = md5(id)`) verified correct;
 - staleness guard: planted a stale state file after advancing the WAL →
   `LFC: WAL advanced since resume state was saved (0/3430AA0 vs 0/28172F0),
-  starting with cold cache`, and the updated rows read back correctly.
+  starting with cold cache`, and the updated rows read back correctly;
+- corruption guard: flipped one byte of `end_of_wal` inside the header →
+  `LFC: resume state file ... has wrong checksum, starting with cold cache`.
+
+When a dump is skipped (LFC disabled at shutdown, or the shutdown wasn't
+clean), the postmaster now logs why — so a cold start is always explainable
+from the previous instance's log.
 
 The extension compiles clean against v14 through v17.
 

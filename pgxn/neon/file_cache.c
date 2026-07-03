@@ -531,7 +531,10 @@ lfc_dump_resume_state(int code, Datum arg)
 	if (code != 0 || !lfc_resume || lfc_ctl == NULL || lfc_max_size <= 0)
 		return;
 	if (!LFC_ENABLED())
+	{
+		elog(LOG, "LFC: disabled at shutdown, not saving resume state");
 		return;
+	}
 
 	/*
 	 * Only a clean shutdown leaves the LFC in sync with the WAL: the
@@ -541,7 +544,11 @@ lfc_dump_resume_state(int code, Datum arg)
 	 */
 	controlfile = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok || controlfile->state != DB_SHUTDOWNED)
+	{
+		elog(LOG, "LFC: shutdown was not clean (pg_control state %d), not saving resume state",
+			 crc_ok ? (int) controlfile->state : -1);
 		return;
+	}
 
 	/*
 	 * Make the cache contents durable before persisting a map that promises
@@ -563,6 +570,9 @@ lfc_dump_resume_state(int code, Datum arg)
 
 	max_entries = lfc_ctl->used;
 	entries = palloc0((size_t) Max(max_entries, 1) * sizeof(LfcResumeEntry));
+
+	/* explicit memset: padding bytes are part of the CRC'd on-disk image */
+	memset(&hdr, 0, sizeof(hdr));
 
 	/* No other processes are alive, but keep the locking discipline */
 	LWLockAcquire(lfc_lock, LW_SHARED);
@@ -602,9 +612,22 @@ lfc_dump_resume_state(int code, Datum arg)
 	hdr.end_of_wal = lfc_normalize_lsn(GetXLogInsertRecPtr());
 	strlcpy(hdr.tenant_id, neon_tenant ? neon_tenant : "", sizeof(hdr.tenant_id));
 	strlcpy(hdr.timeline_id, neon_timeline ? neon_timeline : "", sizeof(hdr.timeline_id));
-	INIT_CRC32C(hdr.crc);
-	COMP_CRC32C(hdr.crc, entries, (size_t) n_entries * sizeof(LfcResumeEntry));
-	FIN_CRC32C(hdr.crc);
+
+	/*
+	 * The CRC covers the header too (with the crc field itself zeroed): the
+	 * header carries the LSN and identity fields that gate the resume, so a
+	 * bit flip there must be detected, not obeyed.
+	 */
+	{
+		pg_crc32c	crc;
+
+		hdr.crc = 0;
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, &hdr, sizeof(hdr));
+		COMP_CRC32C(crc, entries, (size_t) n_entries * sizeof(LfcResumeEntry));
+		FIN_CRC32C(crc);
+		hdr.crc = crc;
+	}
 
 	path = lfc_resume_state_path();
 	tmp_path = psprintf("%s.tmp", path);
@@ -705,9 +728,17 @@ lfc_try_resume_state(void)
 		return false;
 	}
 
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, entries, (size_t) hdr.n_entries * sizeof(LfcResumeEntry));
-	FIN_CRC32C(crc);
+	{
+		LfcResumeHeader hdr_copy;
+
+		/* memcpy, not assignment: padding bytes are part of the CRC'd image */
+		memcpy(&hdr_copy, &hdr, sizeof(hdr_copy));
+		hdr_copy.crc = 0;
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, &hdr_copy, sizeof(hdr_copy));
+		COMP_CRC32C(crc, entries, (size_t) hdr.n_entries * sizeof(LfcResumeEntry));
+		FIN_CRC32C(crc);
+	}
 	if (!EQ_CRC32C(crc, hdr.crc))
 	{
 		elog(LOG, "LFC: resume state file %s has wrong checksum, starting with cold cache", path);
@@ -917,6 +948,7 @@ LfcShmemInit(void)
 		{
 			/* stale resume state, if any, no longer describes this file */
 			unlink(lfc_resume_state_path());
+			unlink(psprintf("%s.tmp", lfc_resume_state_path()));
 
 			fd = BasicOpenFile(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
 			if (fd < 0)
