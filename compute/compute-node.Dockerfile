@@ -455,7 +455,7 @@ RUN mkdir -p /h3/usr/ && \
 # not version-specific
 # last release v4.1.3 - Jul 26, 2023
 WORKDIR /ext-src
-RUN wget https://github.com/zachasme/h3-pg/archive/refs/tags/v4.1.3.tar.gz -O h3-pg.tar.gz && \
+RUN wget https://github.com/postgis/h3-pg/archive/refs/tags/v4.1.3.tar.gz -O h3-pg.tar.gz && \
     echo "5c17f09a820859ffe949f847bebf1be98511fb8f1bd86f94932512c00479e324 h3-pg.tar.gz" | sha256sum --check && \
     mkdir h3-pg-src && cd h3-pg-src && tar xzf ../h3-pg.tar.gz --strip-components=1 -C .
 
@@ -472,8 +472,9 @@ RUN mkdir build && cd build && \
 
 WORKDIR /ext-src/h3-pg-src
 RUN ls -l && \
-    make -j $(getconf _NPROCESSORS_ONLN) && \
-    make -j $(getconf _NPROCESSORS_ONLN) install && \
+    cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build && \
+    cmake --install build --component h3-pg && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3.control && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3_postgis.control
 
@@ -1635,7 +1636,7 @@ ARG PG_VERSION
 USER root
 COPY . .
 
-RUN make -j $(getconf _NPROCESSORS_ONLN) -C pgxn -s install-compute \
+RUN make -C pgxn -s install-compute \
       BUILD_TYPE=release CARGO_BUILD_FLAGS="--locked --release" NEON_CARGO_ARTIFACT_TARGET_DIR="$(pwd)/target/release"
 
 #########################################################################################
