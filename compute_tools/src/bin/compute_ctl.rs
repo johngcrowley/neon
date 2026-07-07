@@ -46,7 +46,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use compute_api::responses::ComputeConfig;
 use compute_tools::compute::{
-    BUILD_TAG, ComputeNode, ComputeNodeParams, forward_termination_signal,
+    BUILD_TAG, ComputeNode, ComputeNodeParams, PG_PID, forward_termination_signal,
 };
 use compute_tools::extension_server::get_pg_version_string;
 use compute_tools::params::*;
@@ -370,6 +370,20 @@ fn deinit_and_exit(tracing_provider: Option<tracing_utils::Provider>, exit_code:
 fn handle_exit_signal(sig: i32, dev_mode: bool) {
     info!("received {sig} termination signal");
     forward_termination_signal(dev_mode);
+    // We are PID 1: exiting ends the container and the runtime SIGKILLs the
+    // postmaster mid-shutdown — losing the shutdown checkpoint and the LFC
+    // resume-state dump its exit hook writes. Outwait postgres instead; the
+    // pod's terminationGracePeriodSeconds is the real deadline, enforced by
+    // the kubelet with SIGKILL whether we cooperate or not.
+    let pg_pid = PG_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pg_pid != 0 {
+        let pid = nix::unistd::Pid::from_raw(pg_pid as i32);
+        info!("waiting for postgres (pid {pg_pid}) to finish its shutdown");
+        while nix::sys::signal::kill(pid, None).is_ok() {
+            thread::sleep(Duration::from_millis(100));
+        }
+        info!("postgres is gone, exiting");
+    }
     exit(1);
 }
 
