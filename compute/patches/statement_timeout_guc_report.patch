@@ -1,0 +1,13 @@
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 9854bc2..5c74a2d 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -2534,7 +2534,7 @@ struct config_int ConfigureNamesInt[] =
+ 		{"statement_timeout", PGC_USERSET, CLIENT_CONN_STATEMENT,
+ 			gettext_noop("Sets the maximum allowed duration of any statement."),
+ 			gettext_noop("A value of 0 turns off the timeout."),
+-			GUC_UNIT_MS
++			GUC_UNIT_MS | GUC_REPORT
+ 		},
+ 		&StatementTimeout,
+ 		0, 0, INT_MAX,
