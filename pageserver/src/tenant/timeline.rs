@@ -69,7 +69,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::*;
 use utils::generation::Generation;
 use utils::guard_arc_swap::GuardArcSwap;
-use utils::id::TimelineId;
+use utils::id::{TenantId, TimelineId};
 use utils::logging::{MonitorSlowFutureCallback, log_slow, monitor_slow_future};
 use utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use utils::postgres_client::PostgresClientProtocol;
@@ -211,6 +211,11 @@ pub struct Timeline {
 
     pub(crate) tenant_shard_id: TenantShardId,
     pub timeline_id: TimelineId,
+
+    /// Tenant ID expected in immutable layer-file summaries. This normally
+    /// equals `tenant_shard_id.tenant_id`; a copied resurrection timeline may
+    /// explicitly authorize the source tenant recorded in its `IndexPart`.
+    pub(crate) layer_summary_tenant_id: TenantId,
 
     /// The generation of the tenant that instantiated us: this is used for safety when writing remote objects.
     /// Never changes for the lifetime of this [`Timeline`] object.
@@ -3166,6 +3171,7 @@ impl Timeline {
         ancestor: Option<Arc<Timeline>>,
         timeline_id: TimelineId,
         tenant_shard_id: TenantShardId,
+        layer_summary_tenant_id: TenantId,
         generation: Generation,
         shard_identity: ShardIdentity,
         walredo_mgr: Option<Arc<super::WalRedoManager>>,
@@ -3225,6 +3231,7 @@ impl Timeline {
                 myself: myself.clone(),
                 timeline_id,
                 tenant_shard_id,
+                layer_summary_tenant_id,
                 generation,
                 shard_identity,
                 pg_version,
