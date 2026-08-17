@@ -861,12 +861,12 @@ impl GCSBucket {
 
         let copy_from_path: String =
             url::form_urlencoded::byte_serialize(
-                self.relative_path_to_gcs_object(to)
+                self.relative_path_to_gcs_object(from)
                     .trim_start_matches("/")
                     .as_bytes()
             )
             .collect();
-        
+
         let copy_to_path: String =
             url::form_urlencoded::byte_serialize(
                 self.relative_path_to_gcs_object(to)

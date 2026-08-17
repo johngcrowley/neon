@@ -97,6 +97,39 @@ async fn gcs_get_object_bytes_range_header(ctx: &mut EnabledGCS) -> anyhow::Resu
     assert_eq!(5, s.len());
     Ok(())
 }
+
+#[test_context(EnabledGCS)]
+#[tokio::test]
+async fn gcs_copy_to_different_path(ctx: &mut EnabledGCS) -> anyhow::Result<()> {
+    let cancel = CancellationToken::new();
+    let source = RemotePath::new(Utf8Path::new(
+        format!("{}/copy-source", ctx.base_prefix).as_str(),
+    ))?;
+    let destination = RemotePath::new(Utf8Path::new(
+        format!("{}/copy-destination", ctx.base_prefix).as_str(),
+    ))?;
+    let expected = "copied across GCS object names";
+
+    let (data, len) = upload_stream(expected.as_bytes().into());
+    ctx.client.upload(data, len, &source, None, &cancel).await?;
+    ctx.client
+        .copy_object(&source, &destination, &cancel)
+        .await?;
+
+    let copied = download_to_vec(
+        ctx.client
+            .download(&destination, &DownloadOpts::default(), &cancel)
+            .await?,
+    )
+    .await?;
+    assert_eq!(copied, expected.as_bytes());
+
+    ctx.client
+        .delete_objects(&[source, destination], &cancel)
+        .await?;
+    Ok(())
+}
+
 #[test_context(EnabledGCS)]
 #[tokio::test]
 async fn gcs_test_suite(ctx: &mut EnabledGCS) -> anyhow::Result<()> {
