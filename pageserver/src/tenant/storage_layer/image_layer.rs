@@ -426,7 +426,10 @@ impl ImageLayerInner {
             // production code path
             expected_summary.index_start_blk = actual_summary.index_start_blk;
             expected_summary.index_root_blk = actual_summary.index_root_blk;
-            // mask out the timeline_id, but still require the layers to be from the same tenant
+            // Mask out the timeline_id because detach_ancestor deliberately
+            // adopts layers across timelines. Tenant identity remains strict;
+            // copied timelines explicitly set their expected source tenant
+            // when constructing this summary.
             expected_summary.timeline_id = actual_summary.timeline_id;
 
             if actual_summary != expected_summary {

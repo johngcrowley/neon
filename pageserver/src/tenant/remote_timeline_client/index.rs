@@ -10,7 +10,7 @@ use pageserver_api::models::AuxFilePolicy;
 use pageserver_api::models::RelSizeMigration;
 use pageserver_api::shard::ShardIndex;
 use serde::{Deserialize, Serialize};
-use utils::id::TimelineId;
+use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
 
 use super::is_same_remote_layer_path;
@@ -148,11 +148,12 @@ impl IndexPart {
     /// - 13: +gc_compaction
     /// - 14: +marked_invisible_at
     /// - 15: +rel_size_migrated_at
-    const LATEST_VERSION: usize = 15;
+    /// - 16: +lineage.layer_summary_tenant_id
+    const LATEST_VERSION: usize = 16;
 
     // Versions we may see when reading from a bucket.
     pub const KNOWN_VERSIONS: &'static [usize] =
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
     pub const FILE_NAME: &'static str = "index_part.json";
 
@@ -178,6 +179,10 @@ impl IndexPart {
 
     pub fn version(&self) -> usize {
         self.version
+    }
+
+    pub(crate) fn layer_summary_tenant_id(&self) -> Option<TenantId> {
+        self.lineage.layer_summary_tenant_id
     }
 
     /// If you want this under normal operations, read it from self.metadata:
@@ -263,6 +268,11 @@ impl LayerFileMetadata {
 /// reparented by having an later timeline be detached from it's ancestor.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct Lineage {
+    /// Tenant identity embedded in deliberately copied layer summaries.
+    /// Ordinary timelines leave this unset and require their own tenant ID.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    layer_summary_tenant_id: Option<TenantId>,
+
     /// Has the `reparenting_history` been truncated to [`Lineage::REMEMBER_AT_MOST`].
     #[serde(skip_serializing_if = "is_false", default)]
     reparenting_history_truncated: bool,
@@ -1424,6 +1434,22 @@ mod tests {
 
         let part = IndexPart::from_json_bytes(example.as_bytes()).unwrap();
         assert_eq!(part, expected);
+    }
+
+    #[test]
+    fn v16_layer_summary_tenant_lineage_roundtrips() {
+        let source_tenant = TenantId::from_str("fcd0e546b7ae51671fedf01541be6995").unwrap();
+        let mut part = IndexPart::example();
+        part.lineage.layer_summary_tenant_id = Some(source_tenant);
+
+        let bytes = part.to_json_bytes().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["version"], 16);
+        assert_eq!(
+            json["lineage"]["layer_summary_tenant_id"],
+            source_tenant.to_string()
+        );
+        assert_eq!(IndexPart::from_json_bytes(&bytes).unwrap(), part);
     }
 
     fn parse_naive_datetime(s: &str) -> NaiveDateTime {

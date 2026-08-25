@@ -12,7 +12,7 @@ use pageserver_api::models::HistoricLayerInfo;
 use pageserver_api::shard::{ShardIdentity, ShardIndex, TenantShardId};
 use tracing::{Instrument, info_span};
 use utils::generation::Generation;
-use utils::id::TimelineId;
+use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
 use utils::sync::{gate, heavier_once_cell};
 
@@ -658,6 +658,10 @@ struct LayerInner {
     /// [`Timeline::gate`] at the same time.
     timeline: Weak<Timeline>,
 
+    /// Tenant ID authorized by the owning timeline's remote index for layer
+    /// summary validation.
+    layer_summary_tenant_id: TenantId,
+
     access_stats: LayerAccessStats,
 
     /// This custom OnceCell is backed by std mutex, but only held for short time periods.
@@ -880,6 +884,7 @@ impl LayerInner {
             path: local_path,
             desc,
             timeline: Arc::downgrade(timeline),
+            layer_summary_tenant_id: timeline.layer_summary_tenant_id,
             access_stats: Default::default(),
             wanted_deleted: AtomicBool::new(false),
             inner,
@@ -1776,7 +1781,7 @@ impl DownloadedLayer {
                     .page_content_kind(crate::context::PageContentKind::DeltaLayerSummary)
                     .attached_child();
                 let summary = Some(delta_layer::Summary::expected(
-                    owner.desc.tenant_shard_id.tenant_id,
+                    owner.layer_summary_tenant_id,
                     owner.desc.timeline_id,
                     owner.desc.key_range.clone(),
                     owner.desc.lsn_range.clone(),
@@ -1795,7 +1800,7 @@ impl DownloadedLayer {
                     .attached_child();
                 let lsn = owner.desc.image_layer_lsn();
                 let summary = Some(image_layer::Summary::expected(
-                    owner.desc.tenant_shard_id.tenant_id,
+                    owner.layer_summary_tenant_id,
                     owner.desc.timeline_id,
                     owner.desc.key_range.clone(),
                     lsn,

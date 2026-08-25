@@ -112,7 +112,7 @@ use crate::{InitializationOrder, TEMP_FILE_SUFFIX, import_datadir, span, task_mg
 static INIT_DB_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(8));
 use utils::crashsafe;
 use utils::generation::Generation;
-use utils::id::TimelineId;
+use utils::id::{TenantId, TimelineId};
 use utils::lsn::{Lsn, RecordLsn};
 
 pub mod blob_io;
@@ -1206,6 +1206,9 @@ impl TenantShard {
             index_part.gc_compaction.clone(),
             index_part.rel_size_migration.clone(),
             index_part.rel_size_migrated_at,
+            index_part
+                .layer_summary_tenant_id()
+                .unwrap_or(self.tenant_shard_id.tenant_id),
             ctx,
         )?;
         let disk_consistent_lsn = timeline.get_disk_consistent_lsn();
@@ -4346,6 +4349,7 @@ impl TenantShard {
         gc_compaction_state: Option<GcCompactionState>,
         rel_size_v2_status: Option<RelSizeMigration>,
         rel_size_migrated_at: Option<Lsn>,
+        layer_summary_tenant_id: TenantId,
         ctx: &RequestContext,
     ) -> anyhow::Result<(Arc<Timeline>, RequestContext)> {
         let state = match cause {
@@ -4370,6 +4374,7 @@ impl TenantShard {
             ancestor,
             new_timeline_id,
             self.tenant_shard_id,
+            layer_summary_tenant_id,
             self.generation,
             self.shard_identity,
             self.walredo_mgr.clone(),
@@ -5494,6 +5499,7 @@ impl TenantShard {
                 None,
                 rel_size_v2_status,
                 rel_size_migrated_at,
+                self.tenant_shard_id.tenant_id,
                 ctx,
             )
             .context("Failed to create timeline data structure")?;
