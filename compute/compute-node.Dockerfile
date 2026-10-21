@@ -127,6 +127,13 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     echo -e "retry_connrefused = on\ntimeout=15\ntries=5\nretry-on-host-error=on\n" > /root/.wgetrc && \
     echo -e "--retry-connrefused\n--connect-timeout 15\n--retry 5\n--max-time 300\n" > /root/.curlrc
 
+# Bullseye LTS ended 2026-08-31; deb.debian.org still serves its indexes but
+# the pool files 404. archive.debian.org has the full set. Repeated in the
+# pgbouncer and final stages, which also start from $BASE_IMAGE_SHA.
+RUN . /etc/os-release && if [ "$VERSION_CODENAME" = bullseye ]; then \
+      printf 'deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\ndeb http://archive.debian.org/debian bullseye-updates main\n' > /etc/apt/sources.list; \
+    fi
+
 RUN case $DEBIAN_VERSION in \
       # Version-specific installs for Bullseye (PG14-PG16):
       # The h3_pg extension needs a cmake 3.20+, but Debian bullseye has 3.18.
@@ -1765,6 +1772,9 @@ RUN --mount=type=cache,uid=1000,target=/home/nonroot/.cargo/registry \
 #########################################################################################
 
 FROM $BASE_IMAGE_SHA AS pgbouncer
+RUN . /etc/os-release && if [ "$VERSION_CODENAME" = bullseye ]; then \
+      printf 'deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\ndeb http://archive.debian.org/debian bullseye-updates main\n' > /etc/apt/sources.list; \
+    fi
 RUN set -e \
     && echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries \
     && apt update \
@@ -1956,6 +1966,9 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 # libevent for pgbouncer
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     echo -e "retry_connrefused = on\ntimeout=15\ntries=5\n" > /root/.wgetrc
+RUN . /etc/os-release && if [ "$VERSION_CODENAME" = bullseye ]; then \
+      printf 'deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\ndeb http://archive.debian.org/debian bullseye-updates main\n' > /etc/apt/sources.list; \
+    fi
 RUN apt update && \
     case $DEBIAN_VERSION in \
       # Version-specific installs for Bullseye (PG14-PG16):
@@ -2002,6 +2015,12 @@ RUN apt update && \
         $VERSION_INSTALLS && \
     apt clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
     localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
+
+# Distrust the eMudhra roots whose intermediates were compromised on 2026-10-17
+# (weak, recoverable keys). Bullseye has no fixed ca-certificates yet, so do
+# what DLA-4845-1 does by hand; harmless no-op once the package catches up.
+RUN sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|AAA_Certificate_Services)\.crt)$#!\1#' /etc/ca-certificates.conf && \
+    update-ca-certificates --fresh
 
 # Add user postgres
 RUN mkdir /var/db && useradd -m -d /var/db/postgres postgres && \
