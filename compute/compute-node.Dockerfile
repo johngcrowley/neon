@@ -173,6 +173,7 @@ COPY vendor/postgres-${PG_VERSION:?} postgres
 COPY compute/patches/postgres_fdw.patch .
 COPY compute/patches/pg_stat_statements_pg14-16.patch .
 COPY compute/patches/pg_stat_statements_pg17.patch .
+COPY compute/patches/statement_timeout_guc_report.patch .
 RUN cd postgres && \
     # Apply patches to some contrib extensions
     # For example, we need to grant EXECUTE on pg_stat_statements_reset() to {privileged_role_name}.
@@ -193,6 +194,19 @@ RUN cd postgres && \
     echo "No contrib patches for this PostgreSQL version" && exit 1;; \
     esac && \
     patch -p1 < /postgres_fdw.patch && \
+    # Mark statement_timeout GUC_REPORT so transaction poolers can replay
+    # app-declared timeouts onto backends at checkout (pgbouncer
+    # track_extra_parameters only works for server-reported parameters;
+    # this fork already reports search_path the same way — see
+    # pgbouncer/pgbouncer#525 and Citus, which does this for search_path).
+    # v16 only for now: that is the version acreops runs in production.
+    case "${PG_VERSION}" in \
+    "v16") \
+    patch -p1 < /statement_timeout_guc_report.patch; \
+    ;; \
+    *) \
+    echo "statement_timeout GUC_REPORT patch not applied for ${PG_VERSION}";; \
+    esac && \
     export CONFIGURE_CMD="./configure CFLAGS='-O2 -g3 -fsigned-char' --enable-debug --with-openssl --with-uuid=ossp \
     --with-icu --with-libxml --with-libxslt --with-lz4" && \
     if [ "${PG_VERSION:?}" != "v14" ]; then \
@@ -455,7 +469,7 @@ RUN mkdir -p /h3/usr/ && \
 # not version-specific
 # last release v4.1.3 - Jul 26, 2023
 WORKDIR /ext-src
-RUN wget https://github.com/zachasme/h3-pg/archive/refs/tags/v4.1.3.tar.gz -O h3-pg.tar.gz && \
+RUN wget https://github.com/postgis/h3-pg/archive/refs/tags/v4.1.3.tar.gz -O h3-pg.tar.gz && \
     echo "5c17f09a820859ffe949f847bebf1be98511fb8f1bd86f94932512c00479e324 h3-pg.tar.gz" | sha256sum --check && \
     mkdir h3-pg-src && cd h3-pg-src && tar xzf ../h3-pg.tar.gz --strip-components=1 -C .
 
@@ -472,8 +486,9 @@ RUN mkdir build && cd build && \
 
 WORKDIR /ext-src/h3-pg-src
 RUN ls -l && \
-    make -j $(getconf _NPROCESSORS_ONLN) && \
-    make -j $(getconf _NPROCESSORS_ONLN) install && \
+    cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build && \
+    cmake --install build --component h3-pg && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3.control && \
     echo 'trusted = true' >> /usr/local/pgsql/share/extension/h3_postgis.control
 
@@ -1635,7 +1650,7 @@ ARG PG_VERSION
 USER root
 COPY . .
 
-RUN make -j $(getconf _NPROCESSORS_ONLN) -C pgxn -s install-compute \
+RUN make -C pgxn -s install-compute \
       BUILD_TYPE=release CARGO_BUILD_FLAGS="--locked --release" NEON_CARGO_ARTIFACT_TARGET_DIR="$(pwd)/target/release"
 
 #########################################################################################
