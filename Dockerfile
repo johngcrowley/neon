@@ -154,6 +154,12 @@ RUN set -e \
     && useradd -d /data neon \
     && chown -R neon:neon /data
 
+# Distrust the eMudhra roots whose intermediates were compromised on 2026-10-17.
+# Bookworm's fixed ca-certificates (DLA-4845-1) already drops them, but a cached
+# apt layer wouldn't know that; this keeps the image honest either way.
+RUN sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|AAA_Certificate_Services)\.crt)$#!\1#' /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh
+
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pg_sni_router       /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pageserver          /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pagectl             /usr/local/bin
