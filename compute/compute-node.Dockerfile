@@ -2019,7 +2019,7 @@ RUN apt update && \
 # Distrust the eMudhra roots whose intermediates were compromised on 2026-10-17
 # (weak, recoverable keys). Bullseye has no fixed ca-certificates yet, so do
 # what DLA-4845-1 does by hand; harmless no-op once the package catches up.
-RUN sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|AAA_Certificate_Services)\.crt)$#!\1#' /etc/ca-certificates.conf && \
+RUN sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt)$#!\1#' /etc/ca-certificates.conf && \
     update-ca-certificates --fresh
 
 # Add user postgres

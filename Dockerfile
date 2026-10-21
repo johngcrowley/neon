@@ -155,10 +155,17 @@ RUN set -e \
     && chown -R neon:neon /data
 
 # Distrust the eMudhra roots whose intermediates were compromised on 2026-10-17.
-# Bookworm's fixed ca-certificates (DLA-4845-1) already drops them, but a cached
-# apt layer wouldn't know that; this keeps the image honest either way.
-RUN sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|AAA_Certificate_Services)\.crt)$#!\1#' /etc/ca-certificates.conf \
-    && update-ca-certificates --fresh
+# Pull bookworm's fixed ca-certificates (DLA-4845-1) past any cached apt layer,
+# disable the two roots by hand in case the mirror lags, and point awscli's
+# vendored botocore bundle at the system store so it can't trust them either.
+RUN apt-get update \
+    && apt-get install -y --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i -E 's#^(mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt)$#!\1#' /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh \
+    && for b in /usr/local/aws-cli/v2/*/dist/awscli/botocore/cacert.pem; do \
+         ln -sf /etc/ssl/certs/ca-certificates.crt "$b"; \
+       done
 
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pg_sni_router       /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pageserver          /usr/local/bin
